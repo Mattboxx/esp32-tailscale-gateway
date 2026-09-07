@@ -47,9 +47,15 @@ the existing AP-side port forwarding.
 
 ## Why the Mattboxx edition is different
 
-Version `0.1.19-Mattboxx-1.4` is based on upstream `v0.1.19`. This firmware line
-is developed, flashed and end-to-end tested on a real ESP32-S3 N16R8; every
-release is also compiled and statically checked before publication.
+The stable **[0.1.19-Mattboxx-1.5 release](../../releases/tag/v0.1.19-Mattboxx-1.5)**
+is based on upstream `v0.1.19`. It improves CPU monitoring, MQTT command safety,
+Tailscale configuration lifetime, ntfy command handling and DHCP parsing.
+The exact hardware-tested binary was promoted without rebuilding, so its
+dashboard still reports `0.1.19-Mattboxx-1.5-dev`; this is the intended 1.5 image.
+See the [release notes](docs/RELEASE-1.5.md) and
+[validation record](docs/REVIEW-1.5.md) for completed checks and remaining
+hardware-test coverage. Stable is the project's release channel, not a formal
+security certification.
 
 | Area | Added or improved in this edition |
 |---|---|

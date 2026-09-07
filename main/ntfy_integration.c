@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "runtime_metrics.h"
 #include "cJSON.h"
 #include "dhcps_ext.h"
 #include "esp_app_desc.h"
@@ -189,6 +190,12 @@ static void send_info(const ntfy_integration_config_t *c)
     char *text = calloc(1, 8192);
     if (!text) return;
     const esp_app_desc_t *app = esp_app_get_description();
+    runtime_metrics_t cpu = runtime_metrics_get();
+    if (cpu.valid)
+        appendf(text, 8192, "CPU: %u%% (core 0: %u%%, core 1: %u%%)\n",
+                cpu.load_pct, cpu.core_pct[0], cpu.core_pct[1]);
+    else
+        appendf(text, 8192, "CPU: sample not available yet\n");
     appendf(text, 8192, "Firmware: %s\nUptime: %llu s\nFree heap: %lu B (minimum %lu B)\nReset reason: %d\nWeb UI port: %u\n",
             app ? app->version : "unknown", esp_timer_get_time() / 1000000ULL,
             (unsigned long)esp_get_free_heap_size(),
@@ -307,6 +314,15 @@ static esp_err_t wake_argument(const ntfy_integration_config_t *c, const char *a
 static void handle_command(const ntfy_integration_config_t *c, const char *message)
 {
     while (*message && isspace((unsigned char)*message)) message++;
+    /* Mobile clients often append a newline. Trim edges without changing
+     * spaces within a saved WOL device name; reject oversized commands. */
+    size_t length = strlen(message);
+    while (length && isspace((unsigned char)message[length - 1])) length--;
+    char command[128];
+    if (!length || length >= sizeof command) return;
+    memcpy(command, message, length);
+    command[length] = '\0';
+    message = command;
     esp_err_t err = ESP_ERR_INVALID_ARG;
     if (c->info_enabled && strcasecmp(message, "info") == 0) {
         send_info(c); err = ESP_OK;

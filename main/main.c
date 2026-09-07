@@ -12,6 +12,7 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 #include <string.h>
+#include "runtime_metrics.h"
 #include <stdlib.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
@@ -1049,6 +1050,7 @@ void app_main(void)
      * matching DHCP-server hook lives in components/dhcpserver/. */
     dhcp_reservations_init();
     wol_init();
+    runtime_metrics_init();
     mqtt_integration_init();
     ntfy_integration_init();
 

@@ -1,8 +1,26 @@
 # Custom ESP32-S3 router branch
 
 This branch starts from upstream `main` at `v0.1.19` and targets the ESP32-S3
-N16R8 used during development. It has been built, flashed and tested on the
-connected board.
+N16R8 used during development. Hardware validation is revision-specific; the
+current changes and pending tests are in [the review record](docs/REVIEW-1.5.md).
+
+## New in the 1.5 stable release
+
+The tested `1.5-dev` binary is promoted unchanged as release 1.5; its embedded
+version intentionally retains that suffix. See [release notes](docs/RELEASE-1.5.md).
+
+- Background CPU monitoring, total and per-core Home Assistant sensors, and
+  CPU readings in ntfy `info`, including counter-rollover handling.
+- Strict MQTT switch/index validation; malformed messages cannot silently
+  switch a feature off or select forwarding rule zero.
+- Coalesced restart/reconnect requests, no-op suppression, and safe full-device
+  restart for MQTT actions that reinitialize Tailscale. Saved credentials and
+  hostname no longer invalidate the running VPN's retained configuration.
+- ntfy command whitespace handling and bounded command length.
+- DHCP request validation before lease mutation, complete pbuf-chain copying,
+  bounded packet allocations and graceful lease-allocation failure handling.
+- Secret checks now inspect reachable Git history and never print matched
+  secrets. Host regression tests also run in the security workflow.
 
 ## Added
 

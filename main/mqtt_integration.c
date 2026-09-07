@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "runtime_metrics.h"
+#include "control_validation.h"
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_app_desc.h"
@@ -39,7 +41,8 @@ static volatile bool s_discovery_requested;
 static volatile bool s_watchdog_triggered;
 static volatile uint32_t s_watchdog_wake_count;
 static volatile int64_t s_last_broker_ok_us;
-static volatile bool s_tailscale_reconnect_pending;
+static volatile bool s_restart_requested;
+static volatile bool s_wifi_reconnect_requested;
 static char s_device_id[24];
 static char s_availability_topic[128];
 static char s_state_topic[128];
@@ -160,6 +163,12 @@ static void publish_discovery(void)
     if (!cfg.home_assistant_discovery || !cfg.discovery_prefix[0]) return;
 
     char command[160];
+    discovery_publish_entity("sensor", "cpu_load", "CPU load", s_state_topic,
+                             "{{ value_json.cpu_load_pct }}", NULL, NULL, "%");
+    discovery_publish_entity("sensor", "cpu_core0", "CPU core 0 load", s_state_topic,
+                             "{{ value_json.cpu_core0_pct }}", NULL, NULL, "%");
+    discovery_publish_entity("sensor", "cpu_core1", "CPU core 1 load", s_state_topic,
+                             "{{ value_json.cpu_core1_pct }}", NULL, NULL, "%");
     discovery_publish_entity("binary_sensor", "uplink", "Uplink", s_state_topic,
                              "{{ value_json.uplink_connected }}", NULL,
                              "connectivity", NULL);
@@ -264,7 +273,7 @@ static void publish_discovery(void)
     discovery_publish_entity("button", "reconnect_wifi", "Reconnect WiFi",
                              NULL, NULL, command, "restart", NULL);
     snprintf(command, sizeof command, "%s/command/reconnect_tailscale", cfg.base_topic);
-    discovery_publish_entity("button", "reconnect_tailscale", "Reconnect Tailscale",
+    discovery_publish_entity("button", "reconnect_tailscale", "Reconnect Tailscale (device restart)",
                              NULL, NULL, command, "restart", NULL);
     snprintf(command, sizeof command, "%s/command/status", cfg.base_topic);
     discovery_publish_entity("button", "publish_status", "Publish status now",
@@ -384,6 +393,16 @@ static void publish_state(void)
     cJSON_AddNumberToObject(root, "ap_clients", client_count);
     cJSON_AddNumberToObject(root, "uptime_seconds", esp_timer_get_time() / 1000000ULL);
     cJSON_AddNumberToObject(root, "free_heap", esp_get_free_heap_size());
+    runtime_metrics_t cpu = runtime_metrics_get();
+    if (cpu.valid) {
+        cJSON_AddNumberToObject(root, "cpu_load_pct", cpu.load_pct);
+        cJSON_AddNumberToObject(root, "cpu_core0_pct", cpu.core_pct[0]);
+        cJSON_AddNumberToObject(root, "cpu_core1_pct", cpu.core_pct[1]);
+    } else {
+        cJSON_AddNullToObject(root, "cpu_load_pct");
+        cJSON_AddNullToObject(root, "cpu_core0_pct");
+        cJSON_AddNullToObject(root, "cpu_core1_pct");
+    }
     cJSON_AddNumberToObject(root, "minimum_free_heap", esp_get_minimum_free_heap_size());
     const esp_app_desc_t *app = esp_app_get_description();
     cJSON_AddStringToObject(root, "firmware", app ? app->version : "");
@@ -414,46 +433,24 @@ static void publish_state(void)
     }
 }
 
-static void delayed_restart(void *arg)
+static void schedule_restart(void)
 {
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(750));
-    esp_restart();
+    /* Only the manager restarts; commands cannot allocate unlimited tasks.
+     * Do not destroy microlink while routing/UI/ntfy still hold its handle. */
+    s_restart_requested = true;
 }
 
-static void reconnect_wifi_task(void *arg)
+static bool set_tailscale_flag(const char *nvs_key, int32_t *runtime, bool enabled)
 {
-    (void)arg;
-    (void)esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(750));
-    (void)esp_wifi_connect();
-    vTaskDelete(NULL);
-}
-
-static void reconnect_tailscale_task(void *arg)
-{
-    (void)arg;
-    tailscale_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    if (tailscale_enabled) (void)tailscale_connect();
-    s_tailscale_reconnect_pending = false;
-    s_publish_requested = true;
-    vTaskDelete(NULL);
-}
-
-static void set_tailscale_flag(const char *nvs_key, int32_t *runtime,
-                               bool enabled)
-{
-    if (nvs_param_set_int(nvs_key, enabled ? 1 : 0) == ESP_OK) {
-        *runtime = enabled ? 1 : 0;
-        publish_state();
+    if ((*runtime != 0) == enabled) return false;
+    esp_err_t err = nvs_param_set_int(nvs_key, enabled ? 1 : 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot save MQTT setting: %s", esp_err_to_name(err));
+        return false;
     }
-}
-
-static bool payload_is_on(const char *payload)
-{
-    return strcasecmp(payload, "ON") == 0 || strcmp(payload, "1") == 0
-        || strcasecmp(payload, "true") == 0;
+    *runtime = enabled ? 1 : 0;
+    s_publish_requested = true;
+    return true;
 }
 
 static void handle_command(const char *topic, const char *payload)
@@ -464,85 +461,71 @@ static void handle_command(const char *topic, const char *payload)
     snprintf(prefix, sizeof prefix, "%s/command/", cfg.base_topic);
     if (strncmp(topic, prefix, strlen(prefix)) != 0) return;
     const char *command = topic + strlen(prefix);
-    ESP_LOGI(TAG, "command: %s", command);
-    if (strcmp(command, "status") == 0) {
-        publish_state();
-    } else if (strcmp(command, "restart") == 0) {
-        xTaskCreate(delayed_restart, "mqtt_restart", 2048, NULL, 4, NULL);
-    } else if (strcmp(command, "ap_always_on") == 0) {
-        bool always_on = payload_is_on(payload);
-        if (nvs_param_set_u8("ap_auto_off", always_on ? 0 : 1) == ESP_OK) {
-            wifi_ap_policy_set_auto_off(!always_on);
-            publish_state();
+    bool enabled = false;
+    bool is_switch = !strcmp(command, "ap_always_on")
+        || !strcmp(command, "tailscale_enabled") || !strcmp(command, "accept_routes")
+        || !strcmp(command, "snat_subnet_routes") || !strcmp(command, "advertise_exit_node")
+        || !strcmp(command, "exit_node_lan_bypass") || !strcmp(command, "fourvia6_enabled")
+        || !strncmp(command, "tailnet_forward/", 16);
+    if (is_switch && !control_parse_bool(payload, &enabled)) {
+        ESP_LOGW(TAG, "Rejected invalid MQTT switch payload");
+        s_publish_requested = true;
+        return;
+    }
+    if (!strcmp(command, "status")) {
+        s_publish_requested = true;
+    } else if (!strcmp(command, "restart")) {
+        schedule_restart();
+    } else if (!strcmp(command, "ap_always_on")) {
+        if (enabled == !wifi_ap_policy_auto_off()) return;
+        if (nvs_param_set_u8("ap_auto_off", enabled ? 0 : 1) == ESP_OK) {
+            wifi_ap_policy_set_auto_off(!enabled);
+            s_publish_requested = true;
         }
-    } else if (strcmp(command, "tailscale_enabled") == 0) {
-        bool enabled = payload_is_on(payload);
-        if (nvs_param_set_int("ts_enabled", enabled ? 1 : 0) == ESP_OK) {
-            tailscale_enabled = enabled ? 1 : 0;
-            publish_state();
-            /* The normal lifecycle is boot-driven; restart keeps teardown and
-             * route-hook state transitions identical to a web-UI change. */
-            xTaskCreate(delayed_restart, "mqtt_ts_toggle", 2048, NULL, 4, NULL);
-        }
-    } else if (strcmp(command, "accept_routes") == 0) {
-        set_tailscale_flag("ts_acpt_rt", &tailscale_accept_routes,
-                           payload_is_on(payload));
-    } else if (strcmp(command, "snat_subnet_routes") == 0) {
-        set_tailscale_flag("ts_snat_sr", &tailscale_snat_subnet_routes,
-                           payload_is_on(payload));
-    } else if (strcmp(command, "advertise_exit_node") == 0) {
-        bool enable_exit_advert = payload_is_on(payload);
-        if (enable_exit_advert && tailscale_exit_node_ip != 0) {
+    } else if (!strcmp(command, "tailscale_enabled")) {
+        if (set_tailscale_flag("ts_enabled", &tailscale_enabled, enabled))
+            schedule_restart();
+    } else if (!strcmp(command, "accept_routes")) {
+        set_tailscale_flag("ts_acpt_rt", &tailscale_accept_routes, enabled);
+    } else if (!strcmp(command, "snat_subnet_routes")) {
+        set_tailscale_flag("ts_snat_sr", &tailscale_snat_subnet_routes, enabled);
+    } else if (!strcmp(command, "advertise_exit_node")) {
+        if (enabled && tailscale_exit_node_ip != 0) {
             ESP_LOGW(TAG, "Cannot advertise as exit node while another exit node is selected");
-            publish_state();
+            s_publish_requested = true;
             return;
         }
-        set_tailscale_flag("ts_adv_exit", &tailscale_advertise_exit_node,
-                           enable_exit_advert);
-        /* The two default routes live in Hostinfo and require a fresh
-         * registration; reconnect just the VPN instead of rebooting. */
-        if (!s_tailscale_reconnect_pending && tailscale_enabled) {
-            s_tailscale_reconnect_pending = true;
-            if (xTaskCreate(reconnect_tailscale_task, "mqtt_ts_adv_exit",
-                            4096, NULL, 4, NULL) != pdPASS) {
-                s_tailscale_reconnect_pending = false;
-            }
-        }
-    } else if (strcmp(command, "exit_node_lan_bypass") == 0) {
-        set_tailscale_flag("ts_lan_bp", &tailscale_lan_bypass,
-                           payload_is_on(payload));
-    } else if (strcmp(command, "fourvia6_enabled") == 0) {
+        if (set_tailscale_flag("ts_adv_exit", &tailscale_advertise_exit_node, enabled)
+            && tailscale_enabled) schedule_restart();
+    } else if (!strcmp(command, "exit_node_lan_bypass")) {
+        set_tailscale_flag("ts_lan_bp", &tailscale_lan_bypass, enabled);
+    } else if (!strcmp(command, "fourvia6_enabled")) {
         fourvia6_status_t v6;
         fourvia6_get_status(&v6);
+        if (v6.enabled == enabled) return;
         char error[96];
-        if (fourvia6_set_config(payload_is_on(payload), v6.lan_cidr,
-                                v6.site_id, error, sizeof error) == ESP_OK) {
-            publish_state();
-            /* Route advertisement is built when microlink starts. */
-            xTaskCreate(delayed_restart, "mqtt_4via6", 2048, NULL, 4, NULL);
+        if (fourvia6_set_config(enabled, v6.lan_cidr, v6.site_id, error, sizeof error) == ESP_OK) {
+            s_publish_requested = true;
+            schedule_restart();
         }
-    } else if (strcmp(command, "reconnect_wifi") == 0) {
-        xTaskCreate(reconnect_wifi_task, "mqtt_wifi_reconnect", 2048, NULL, 4, NULL);
-    } else if (strcmp(command, "reconnect_tailscale") == 0) {
-        if (!s_tailscale_reconnect_pending) {
-            s_tailscale_reconnect_pending = true;
-            if (xTaskCreate(reconnect_tailscale_task, "mqtt_ts_reconnect",
-                            4096, NULL, 4, NULL) != pdPASS) {
-                s_tailscale_reconnect_pending = false;
-            }
+    } else if (!strcmp(command, "reconnect_wifi")) {
+        s_wifi_reconnect_requested = true;
+    } else if (!strcmp(command, "reconnect_tailscale")) {
+        if (tailscale_enabled) schedule_restart();
+    } else if (!strncmp(command, "tailnet_forward/", 16)) {
+        unsigned index;
+        if (control_parse_index(command + 16, TAILNET_FORWARD_MAX, &index)
+            && tailnet_forward_set_enabled((int)index, enabled) == ESP_OK) {
+            s_publish_requested = true;
+            s_discovery_requested = true;
         }
-    } else if (strncmp(command, "tailnet_forward/", 16) == 0) {
-        char *end=NULL; long index=strtol(command+16,&end,10);
-        if(end && *end==0 && index>=0 && index<TAILNET_FORWARD_MAX && tailnet_forward_set_enabled((int)index,payload_is_on(payload))==ESP_OK) {
-            s_publish_requested=true; s_discovery_requested=true;
-        }
-    } else if (strncmp(command, "wol/", 4) == 0) {
+    } else if (!strncmp(command, "wol/", 4)) {
         const char *compact = command + 4;
         char mac[18];
         if (strlen(compact) == 12) {
             snprintf(mac, sizeof mac, "%.2s:%.2s:%.2s:%.2s:%.2s:%.2s",
-                     compact, compact + 2, compact + 4, compact + 6, compact + 8,
-                     compact + 10);
+                     compact, compact + 2, compact + 4, compact + 6,
+                     compact + 8, compact + 10);
             (void)wol_send_saved_mac_text(mac);
         } else {
             (void)wol_send_saved_mac_text(compact);
@@ -587,7 +570,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             return;
         }
         if (event->current_data_offset != 0 || event->data_len != event->total_data_len
-            || event->topic_len <= 0 || event->topic_len >= 191 || event->data_len >= 127) return;
+            || event->topic_len <= 0 || event->topic_len >= 191
+            || event->data_len <= 0 || event->data_len >= 127
+            || !event->topic || !event->data
+            || memchr(event->topic, '\0', event->topic_len)
+            || memchr(event->data, '\0', event->data_len)) return;
         char topic[192];
         char payload[128];
         memcpy(topic, event->topic, event->topic_len);
@@ -655,6 +642,18 @@ static void manager_task(void *arg)
     int elapsed = 0;
     while (true) {
         uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+        if (s_restart_requested) {
+            ESP_LOGW(TAG, "Applying MQTT command with a controlled device restart");
+            publish_state();
+            vTaskDelay(pdMS_TO_TICKS(750));
+            esp_restart();
+        }
+        if (s_wifi_reconnect_requested) {
+            s_wifi_reconnect_requested = false;
+            (void)esp_wifi_disconnect();
+            vTaskDelay(pdMS_TO_TICKS(750));
+            (void)esp_wifi_connect();
+        }
         if (notified) {
             stop_client();
             start_client();

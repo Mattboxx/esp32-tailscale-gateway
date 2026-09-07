@@ -2258,7 +2258,7 @@
 
           <div class="form-group">
             <label class="form-label" for="ts-routes">Advertised Subnet Routes</label>
-            <textarea class="textarea input" id="ts-routes" placeholder="192.168.4.0/24" style="min-height:5rem; font-family:var(--font-mono); font-size:0.9rem;"></textarea>
+            <textarea class="textarea input" id="ts-routes" maxlength="400" placeholder="192.168.4.0/24" style="min-height:5rem; font-family:var(--font-mono); font-size:0.9rem;"></textarea>
             <span class="form-hint">One CIDR per line.</span>
           </div>
 
@@ -3545,11 +3545,13 @@
       var cpuLoadEl = document.getElementById('sys-cpu-load');
       if (typeof data.cpu_load_pct === 'number') {
         cpuLoadEl.textContent = data.cpu_load_pct + ' %';
+        cpuLoadEl.title = 'Core 0: ' + data.cpu_core0_pct + '% / Core 1: ' + data.cpu_core1_pct + '%';
         cpuLoadEl.style.color = data.cpu_load_pct > 80 ? 'var(--danger)'
                               : data.cpu_load_pct > 50 ? 'var(--warning)'
                               :                          'var(--success)';
       } else {
         cpuLoadEl.textContent = '—';
+        cpuLoadEl.title = 'CPU sample not available yet';
         cpuLoadEl.style.color = '';
       }
 

@@ -46,6 +46,16 @@ def run(ctx: Context) -> list[Result]:
         for key in ("connected", "tunnel_ip", "identity_persistent", "identity_pubkey_prefix"):
             check(results, MODULE_ID, f"runtime.{key} present", key in rt, f"runtime={list(rt.keys())}")
 
+        # Negative-only probes: every request must fail before changing NVS.
+        for field, invalid in (("max_peers", 65), ("max_peers", 1.5),
+                               ("default_derp_region", -1),
+                               ("netcheck_threshold_ms", 5001),
+                               ("advertise_routes", "x" * 401)):
+            response = spa.post_json("/api/tailscale", {"settings": {field: invalid}})
+            check(results, MODULE_ID, f"reject invalid {field}",
+                  isinstance(response, dict) and response.get("__http_status") == 400,
+                  "invalid setting must return HTTP 400")
+
         check(results, MODULE_ID, "runtime.connected", bool(rt.get("connected")),
               f"runtime={rt}")
         check(results, MODULE_ID, "tunnel_ip starts with 100.",

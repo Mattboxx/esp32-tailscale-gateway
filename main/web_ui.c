@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include "runtime_metrics.h"
 #include "sdkconfig.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -193,66 +194,6 @@ static const char *reset_reason_str(void)
     return base;
 }
 
-/* Live CPU-load percentage from the FreeRTOS runtime-stats counters.
- * Compares the IDLE0+IDLE1 task tick deltas against the total execution
- * capacity across all cores
- * since the previous sample, so the first call returns 0 and every
- * call after that gives the load over the elapsed interval. Throttled
- * to 1-per-second so the same /api/status poll burst doesn't churn
- * the sampler. Requires CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y. */
-static uint8_t sample_cpu_load_pct(void)
-{
-    static uint64_t s_last_sample_us = 0;
-    static uint32_t s_last_total     = 0;
-    static uint32_t s_last_idle      = 0;
-    static uint8_t  s_last_load_pct  = 0;
-
-    uint64_t now = (uint64_t)esp_timer_get_time();
-    if (s_last_sample_us != 0 && now - s_last_sample_us < 1000000) {
-        return s_last_load_pct;
-    }
-
-    /* Leave a little headroom for tasks created between the count and the
-     * snapshot. If the array is too small uxTaskGetSystemState returns zero. */
-    UBaseType_t n = uxTaskGetNumberOfTasks() + 4;
-    TaskStatus_t *arr = malloc(sizeof(TaskStatus_t) * n);
-    if (!arr) return s_last_load_pct;
-    uint32_t total = 0;
-    UBaseType_t got = uxTaskGetSystemState(arr, n, &total);
-
-    if (got == 0 || total == 0) {
-        free(arr);
-        return s_last_load_pct;
-    }
-
-    uint32_t idle = 0;
-    for (UBaseType_t i = 0; i < got; i++) {
-        if (arr[i].pcTaskName && strncmp(arr[i].pcTaskName, "IDLE", 4) == 0) {
-            idle += arr[i].ulRunTimeCounter;
-        }
-    }
-    free(arr);
-
-    if (s_last_sample_us != 0 && total > s_last_total) {
-        uint32_t total_delta = total - s_last_total;
-        uint32_t idle_delta  = idle  - s_last_idle;
-        uint64_t capacity_delta = (uint64_t)total_delta * configNUMBER_OF_CORES;
-        /* uxTaskGetSystemState returns one wall-clock run-time counter, while
-         * each core has its own IDLE task. On the dual-core S3 the previous
-         * code compared IDLE0+IDLE1 against only one core's elapsed time, so
-         * idle_delta was almost always >= total_delta and the UI stuck at 0%.
-         * Normalize against the aggregate capacity of every active core. */
-        if ((uint64_t)idle_delta >= capacity_delta) {
-            s_last_load_pct = 0;
-        } else {
-            s_last_load_pct = (uint8_t)(100 - ((uint64_t)idle_delta * 100 / capacity_delta));
-        }
-    }
-    s_last_total     = total;
-    s_last_idle      = idle;
-    s_last_sample_us = now;
-    return s_last_load_pct;
-}
 
 /* Internal CPU temperature in °C, or -999 if the sensor isn't available.
  * Lazy-installs on first call; the sensor draws ~1 mA continuously while
@@ -298,7 +239,14 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "mem_internal_total", heap_caps_get_total_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(root, "mem_spiram_free",    heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     cJSON_AddNumberToObject(root, "mem_spiram_total",   heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
-    cJSON_AddNumberToObject(root, "cpu_load_pct",       sample_cpu_load_pct());
+    runtime_metrics_t cpu = runtime_metrics_get();
+    if (cpu.valid) {
+        cJSON_AddNumberToObject(root, "cpu_load_pct", cpu.load_pct);
+        cJSON_AddNumberToObject(root, "cpu_core0_pct", cpu.core_pct[0]);
+        cJSON_AddNumberToObject(root, "cpu_core1_pct", cpu.core_pct[1]);
+    } else {
+        cJSON_AddNullToObject(root, "cpu_load_pct");
+    }
     {
         float tc = sample_cpu_temp_c();
         if (tc > -100.0f) cJSON_AddNumberToObject(root, "cpu_temp_c", tc);
@@ -3155,6 +3103,22 @@ static esp_err_t tailscale_save_handler(httpd_req_t *req)
         /* Acting as an exit node and consuming another exit node at the same
          * time would route received Internet traffic straight back into the
          * tunnel. Reject the ambiguous configuration before any NVS writes. */
+        const cJSON *routes = cJSON_GetObjectItem(s, "advertise_routes");
+        const cJSON *max_peers = cJSON_GetObjectItem(s, "max_peers");
+        const cJSON *region = cJSON_GetObjectItem(s, "default_derp_region");
+        const cJSON *threshold = cJSON_GetObjectItem(s, "netcheck_threshold_ms");
+        if ((routes && (!cJSON_IsString(routes) || strlen(routes->valuestring) > 400))
+            || (max_peers && (!cJSON_IsNumber(max_peers) || max_peers->valuedouble < 1
+                || max_peers->valuedouble > 64 || max_peers->valuedouble != max_peers->valueint))
+            || (region && (!cJSON_IsNumber(region) || region->valuedouble < 0
+                || region->valuedouble > 65535 || region->valuedouble != region->valueint))
+            || (threshold && (!cJSON_IsNumber(threshold) || threshold->valuedouble < 0
+                || threshold->valuedouble > 5000 || threshold->valuedouble != threshold->valueint))) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "invalid Tailscale settings: routes max 400 bytes, peers 1-64, DERP 0-65535, threshold 0-5000");
+            return ESP_FAIL;
+        }
         const cJSON *advertise_exit = cJSON_GetObjectItem(s, "advertise_exit_node");
         const cJSON *selected_exit = cJSON_GetObjectItem(s, "exit_node_ip");
         bool want_advertise_exit = cJSON_IsBool(advertise_exit)

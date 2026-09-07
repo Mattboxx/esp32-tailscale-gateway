@@ -20,6 +20,7 @@
 #include "dhcpserver/dhcpserver.h"
 #include "dhcpserver/dhcpserver_options.h"
 #include "dhcps_ext.h"
+#include "dhcps_validation.h"
 
 #if ESP_DHCPS
 
@@ -924,7 +925,6 @@ static void send_ack(dhcps_t *dhcps, struct dhcps_msg *m, u16_t len)
 static u8_t parse_options(dhcps_t *dhcps, u8_t *optptr, s16_t len)
 {
     ip4_addr_t client;
-    bool is_dhcp_parse_end = false;
     struct dhcps_state s;
 
     client.addr = *((uint32_t *) &dhcps->client_address);
@@ -949,19 +949,18 @@ static u8_t parse_options(dhcps_t *dhcps, u8_t *optptr, s16_t len)
         }
 
         if (*optptr == DHCP_OPTION_END) {
-            is_dhcp_parse_end = true;
             break;
         }
 
         /* All other options require at least a length byte after the type */
-        if (optptr + 1 >= end) {
+        if ((size_t)(end - optptr) < 2) {
             break;  /* Truncated: no room for length byte */
         }
 
         u8_t opt_len = optptr[1];
 
         /* Verify the entire option fits within the buffer */
-        if (optptr + 2 + opt_len > end) {
+        if ((size_t)opt_len > (size_t)(end - optptr) - 2) {
             break;  /* Truncated option data */
         }
 
@@ -1152,11 +1151,16 @@ static s16_t parse_msg(dhcps_t *dhcps, struct dhcps_msg *m, u16_t len)
             pnode = NULL;
         } else {
             pdhcps_pool = (struct dhcps_pool *)mem_calloc(1, sizeof(struct dhcps_pool));
+            if (pdhcps_pool == NULL) return DHCPS_STATE_IDLE;
 
             pdhcps_pool->ip.addr = dhcps->client_address.addr;
             memcpy(pdhcps_pool->mac, m->chaddr, sizeof(pdhcps_pool->mac));
             pdhcps_pool->lease_timer = lease_timer;
             pnode = (list_node *)mem_calloc(1, sizeof(list_node));
+            if (pnode == NULL) {
+                free(pdhcps_pool);
+                return DHCPS_STATE_IDLE;
+            }
 
             pnode->pnode = pdhcps_pool;
             pnode->pnext = NULL;
@@ -1188,7 +1192,7 @@ POOL_CHECK:
             return 4;
         }
 
-        s16_t ret = parse_options(dhcps, &m->options[4], len);;
+        s16_t ret = parse_options(dhcps, &m->options[4], len);
 
         if (ret == DHCPS_STATE_RELEASE || ret == DHCPS_STATE_NAK || ret ==  DHCPS_STATE_DECLINE) {
             if (pnode != NULL) {
@@ -1240,11 +1244,7 @@ static void handle_dhcp(void *arg,
 {
     struct dhcps_t *dhcps = arg;
     struct dhcps_msg *pmsg_dhcps = NULL;
-    s16_t tlen, malloc_len;
-    u16_t i;
-    u16_t dhcps_msg_cnt = 0;
-    u8_t *p_dhcps_msg = NULL;
-    u8_t *data;
+    u16_t tlen, malloc_len;
     s16_t state;
 
 #if DHCPS_DEBUG
@@ -1252,6 +1252,11 @@ static void handle_dhcp(void *arg,
 #endif
 
     if (p == NULL) {
+        return;
+    }
+
+    if (p->tot_len < 244 || p->tot_len > DHCPS_MAX_REQUEST_LEN) {
+        pbuf_free(p);
         return;
     }
 
@@ -1269,52 +1274,14 @@ static void handle_dhcp(void *arg,
         return;
     }
 
-    p_dhcps_msg = (u8_t *)pmsg_dhcps;
     tlen = p->tot_len;
-    data = p->payload;
-
-#if DHCPS_DEBUG
-    DHCPS_LOG("dhcps: handle_dhcp-> p->tot_len = %d\n", tlen);
-    DHCPS_LOG("dhcps: handle_dhcp-> p->len = %d\n", p->len);
-#endif
-
-    for (i = 0; i < p->len; i++) {
-        p_dhcps_msg[dhcps_msg_cnt++] = data[i];
-#if DHCPS_DEBUG
-        DHCPS_LOG("%02x ", data[i]);
-
-        if ((i + 1) % 16 == 0) {
-            DHCPS_LOG("\n");
-        }
-
-#endif
+    /* Copy every pbuf in the chain, not just its first two segments. */
+    if (pbuf_copy_partial(p, pmsg_dhcps, tlen, 0) != tlen
+        || !dhcps_request_valid((const uint8_t *)pmsg_dhcps, tlen)) {
+        free(pmsg_dhcps);
+        pbuf_free(p);
+        return;
     }
-
-    if (p->next != NULL) {
-#if DHCPS_DEBUG
-        DHCPS_LOG("dhcps: handle_dhcp-> p->next != NULL\n");
-        DHCPS_LOG("dhcps: handle_dhcp-> p->next->tot_len = %d\n", p->next->tot_len);
-        DHCPS_LOG("dhcps: handle_dhcp-> p->next->len = %d\n", p->next->len);
-#endif
-
-        data = p->next->payload;
-
-        for (i = 0; i < p->next->len; i++) {
-            p_dhcps_msg[dhcps_msg_cnt++] = data[i];
-#if DHCPS_DEBUG
-            DHCPS_LOG("%02x ", data[i]);
-
-            if ((i + 1) % 16 == 0) {
-                DHCPS_LOG("\n");
-            }
-
-#endif
-        }
-    }
-
-#if DHCPS_DEBUG
-    DHCPS_LOG("dhcps: handle_dhcp-> parse_msg(p)\n");
-#endif
 
     state = parse_msg(dhcps, pmsg_dhcps, tlen - 240);
 #ifdef LWIP_HOOK_DHCPS_POST_STATE

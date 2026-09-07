@@ -59,6 +59,13 @@ static uint32_t tailscale_subnet_mask = 0;
 
 /* Microlink instance owned by this module. */
 static microlink_t *s_microlink = NULL;
+/* microlink retains these pointers for future registrations. Web saves may
+ * replace/free the editable globals, so give the running instance immutable
+ * boot-lifetime copies. New credentials/hostname take effect after restart. */
+static char *s_active_auth_key;
+static char *s_active_hostname;
+static char *s_active_login_server;
+static char *s_active_advertise_routes;
 
 /* Start SNTP if it has not been started yet.  Called by tailscale_connect_task
  * (before the WireGuard handshake needs real wall-clock time) and by the WiFi
@@ -81,6 +88,10 @@ void tailscale_init(void)
     tailscale_hostname         = nvs_str_or_empty("ts_hostname");
     tailscale_login_server     = nvs_str_or_empty("ts_login");
     tailscale_advertise_routes = nvs_str_or_empty("ts_routes");
+    s_active_auth_key = nvs_str_or_empty("ts_authkey");
+    s_active_hostname = nvs_str_or_empty("ts_hostname");
+    s_active_login_server = nvs_str_or_empty("ts_login");
+    s_active_advertise_routes = nvs_str_or_empty("ts_routes");
     if (nvs_param_get_int("ts_adv_exit", &v) == ESP_OK) {
         tailscale_advertise_exit_node = (v ? 1 : 0);
     }
@@ -150,27 +161,23 @@ esp_err_t tailscale_connect(void)
         ESP_LOGI(TAG, "Tailscale not enabled");
         return ESP_ERR_INVALID_STATE;
     }
-    if (!tailscale_auth_key || !tailscale_auth_key[0]) {
+    if (!s_active_auth_key || !s_active_auth_key[0] || !s_active_hostname
+        || !s_active_login_server || !s_active_advertise_routes) {
         ESP_LOGE(TAG, "Missing auth key (ts_authkey)");
         return ESP_ERR_INVALID_ARG;
     }
 
     if (s_microlink) {
-        ESP_LOGW(TAG, "Already initialized; tearing down prior instance first");
-        /* Stop the SD recorder from sampling this instance before we free it:
-         * its writer task calls microlink_get_* accessors on the handle, and
-         * between destroy() and the sdlog_set_microlink() further down it
-         * would read freed memory. Clear the handle first to close that
-         * teardown window (paired with microlink_stop's socket unblocking,
-         * the fix for the 2026-05-26 ml_derp_tx teardown crash). */
-        sdlog_set_microlink(NULL);
-        microlink_stop(s_microlink);
-        microlink_destroy(s_microlink);
-        s_microlink = NULL;
+        ESP_LOGW(TAG, "Already initialized; restart the device to reconnect safely");
+        return ESP_ERR_INVALID_STATE;
     }
 
     char effective_routes[512];
-    fourvia6_effective_routes(tailscale_advertise_routes,
+    if (strlen(s_active_advertise_routes) > 400) {
+        ESP_LOGE(TAG, "Advertised routes exceed the supported 400-byte limit");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    fourvia6_effective_routes(s_active_advertise_routes,
                               effective_routes, sizeof effective_routes);
     if (tailscale_advertise_exit_node) {
         /* Stock tailscaled represents --advertise-exit-node as both default
@@ -188,8 +195,8 @@ esp_err_t tailscale_connect(void)
     }
 
     microlink_config_t cfg = {
-        .auth_key = tailscale_auth_key,
-        .device_name = (tailscale_hostname && tailscale_hostname[0]) ? tailscale_hostname : NULL,
+        .auth_key = s_active_auth_key,
+        .device_name = s_active_hostname[0] ? s_active_hostname : NULL,
         .enable_derp = true,
         .enable_stun = true,
         .enable_disco = true,
@@ -200,32 +207,30 @@ esp_err_t tailscale_connect(void)
         .disco_heartbeat_ms = 0,
         .stun_interval_ms = 0,
         .ctrl_watchdog_ms = 0,
-        .ctrl_host = (tailscale_login_server && tailscale_login_server[0]) ? tailscale_login_server : NULL,
+        .ctrl_host = s_active_login_server[0] ? s_active_login_server : NULL,
         .advertise_routes = effective_routes[0] ? effective_routes : NULL,
         .netcheck_override_enabled = (tailscale_netcheck_override != 0),
         .netcheck_override_threshold_ms = (uint32_t)tailscale_netcheck_threshold_ms,
         .preferred_derp_region = (uint16_t)tailscale_default_derp_region,
     };
 
-    s_microlink = microlink_init(&cfg);
-    if (!s_microlink) {
+    microlink_t *instance = microlink_init(&cfg);
+    if (!instance) {
         ESP_LOGE(TAG, "microlink_init failed");
         return ESP_FAIL;
     }
 
-    /* Hand the SD flight-recorder the handle so its SNAP line can sample
-     * task states + DERP heartbeat age — the wedge-catching signals. */
-    sdlog_set_microlink(s_microlink);
-
-    esp_err_t err = microlink_start(s_microlink);
+    /* Publish only a successfully started instance. Readers must never see
+     * an object that the start-failure path is about to destroy. */
+    esp_err_t err = microlink_start(instance);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "microlink_start failed: %s", esp_err_to_name(err));
-        sdlog_set_microlink(NULL);   /* handle was set above; unset before free */
-        microlink_destroy(s_microlink);
-        s_microlink = NULL;
+        microlink_destroy(instance);
         return err;
     }
 
+    s_microlink = instance;
+    sdlog_set_microlink(instance);
     tailscale_connected = true;
     ESP_LOGI(TAG, "Tailscale started (device=%s, ctrl=%s, routes=%s, advertise_exit=%s, max_peers=%d)",
              cfg.device_name ? cfg.device_name : "<auto>",

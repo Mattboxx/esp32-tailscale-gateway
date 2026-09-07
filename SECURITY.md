@@ -64,7 +64,7 @@ maintained.
   reach the ESP32: ordinary settings, restart, WOL and automation controls are
   then public. Secret export/import, OTA, identity reset and factory reset
   still require a real password-backed session.
-- The embedded UI is HTTP-only. Do not forward port 80 to the Internet or an
+- The embedded UI is HTTP-only. Do not forward its configured port to the Internet or an
   untrusted VLAN. Prefer access through a trusted LAN or the encrypted
   Tailscale path, and disable the access point when it is not needed.
 - Prefer `mqtts://`, `wss://`, and `https://` transports. If a plaintext local
@@ -72,9 +72,20 @@ maintained.
   broker/topic ACLs. Anyone allowed to publish commands can operate WOL and
   the exposed router controls.
 - Use an access-controlled, unguessable ntfy topic. The optional `info`
-  response never contains passwords or tokens; network topology, peer names/
-  IPs, AP-client MACs and saved WOL targets are omitted unless the separate
-  private-details option is explicitly enabled.
+  response excludes passwords and tokens. Network topology, peer names/IPs,
+  AP-client MACs and WOL MAC/broadcast details require the private-details
+  option. Saved WOL device **names are always included**, as an intentional
+  convenience; do not put sensitive information in those names.
+
+## Review limitations
+
+See [the 1.5 review record](docs/REVIEW-1.5.md) for fixes and validation scope.
+Pattern-based secret scans and successful compilation are not a penetration
+test and cannot establish the absence of vulnerabilities or personal data.
+The CI history scan checks fetched, reachable Git objects. It cannot inspect
+deleted remote objects, third-party clones or caches, GitHub messages, or the
+device's private NVS storage. The HTTP UI and unencrypted flash/NVS boundaries
+above remain unchanged.
 
 ## Hardware-security boundary
 

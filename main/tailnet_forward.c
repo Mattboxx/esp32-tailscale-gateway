@@ -1,4 +1,5 @@
 #include "tailnet_forward.h"
+#include "control_validation.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,12 +39,12 @@ static bool hostname_valid(const char *s) {
 }
 
 esp_err_t tailnet_forward_parse_cidr(const char *text, uint32_t *network, uint8_t *prefix) {
-    if (!text || !network || !prefix) return ESP_ERR_INVALID_ARG;
+    if (!text || !network || !prefix || strlen(text) >= 32) return ESP_ERR_INVALID_ARG;
     char copy[32]; strlcpy(copy,text,sizeof copy); char *slash=strchr(copy,'/');
     if (!slash) return ESP_ERR_INVALID_ARG;
     *slash++=0;
-    char *end=NULL; long p=strtol(slash,&end,10); ip4_addr_t a;
-    if (!*slash || *end || p<0 || p>32 || !ip4addr_aton(copy,&a)) return ESP_ERR_INVALID_ARG;
+    unsigned p; ip4_addr_t a;
+    if (!control_parse_index(slash,33,&p) || !ip4addr_aton(copy,&a)) return ESP_ERR_INVALID_ARG;
     uint32_t h=lwip_ntohl(a.addr), mask=p==0?0:(p==32?0xffffffffu:0xffffffffu<<(32-p));
     *network=h&mask; *prefix=(uint8_t)p; return ESP_OK;
 }
